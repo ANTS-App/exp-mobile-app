@@ -2,7 +2,12 @@ package com.example.attendanceapp
 
 import android.Manifest
 import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothManager
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.widget.Toast
@@ -19,22 +24,43 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
-
 import com.example.attendanceapp.ui.theme.AttendanceAppTheme
+import com.example.attendanceapp.utilities.GeolocationHelper
 
 class StudentActivity : ComponentActivity() {
     private lateinit var databaseHelper: DatabaseHelper
     private lateinit var geolocationHelper: GeolocationHelper
     private lateinit var bluetoothHelper: BluetoothHelper
 
+    private var teacherMacAddress: String? = null
+    private var bluetoothAdapter: BluetoothAdapter? = null
+
+    private val isTeacherNearby = mutableStateOf(false)
+    private val scanInProgress = mutableStateOf(false)
+
     private val requestPermissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
         val allGranted = permissions.entries.all { it.value }
-        if (allGranted) {
-            Toast.makeText(this, "All permissions granted", Toast.LENGTH_SHORT).show()
-        } else {
-            Toast.makeText(this, "Some permissions were denied", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this,
+            if (allGranted) "All permissions granted" else "Some permissions were denied",
+            Toast.LENGTH_SHORT
+        ).show()
+    }
+
+    private val bluetoothReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == BluetoothDevice.ACTION_FOUND) {
+                val device: BluetoothDevice? = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+                if (device?.address.equals(teacherMacAddress, ignoreCase = true)) {
+                    isTeacherNearby.value = true
+                    scanInProgress.value = false
+                    try {
+                        unregisterReceiver(this)
+                    } catch (_: Exception) {}
+                    Toast.makeText(this@StudentActivity, "Teacher found nearby via Bluetooth!", Toast.LENGTH_SHORT).show()
+                }
+            }
         }
     }
 
@@ -45,44 +71,65 @@ class StudentActivity : ComponentActivity() {
         geolocationHelper = GeolocationHelper(this)
         bluetoothHelper = BluetoothHelper(this)
 
+        val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+        bluetoothAdapter = bluetoothManager?.adapter
+
         requestPermissions()
+        fetchTeacherBluetoothMac()
 
         setContent {
             AttendanceAppTheme {
-                Surface(
-                    modifier = Modifier.fillMaxSize(),
-                    color = MaterialTheme.colorScheme.background
-                ) {
+                Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     StudentScreen(
-                        databaseHelper = databaseHelper,
-                        geolocationHelper = geolocationHelper,
-                        bluetoothHelper = bluetoothHelper,
+                        isBluetoothEnabled = bluetoothHelper.isBluetoothEnabled(),
+                        scanInProgress = scanInProgress.value,
+                        isTeacherNearby = isTeacherNearby.value,
+                        onStartScan = { startBluetoothScan() },
                         onRequestPermissions = { requestPermissions() },
-                        onNavigateToTimetable = { checkConditionsBeforeAttendance() }
+                        onVerifyLocation = { verifyLocationBeforeProceed() }
                     )
                 }
             }
         }
     }
 
-    private fun checkConditionsBeforeAttendance() {
+    private fun fetchTeacherBluetoothMac() {
+        val ref = com.google.firebase.database.FirebaseDatabase.getInstance()
+            .getReference("teachers/bluetoothSignature")
+
+        ref.get().addOnSuccessListener {
+            teacherMacAddress = it.getValue(String::class.java)
+        }.addOnFailureListener {
+            Toast.makeText(this, "Failed to get teacher MAC", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun startBluetoothScan() {
         if (!bluetoothHelper.isBluetoothEnabled()) {
-            Toast.makeText(this, "Please enable Bluetooth to mark attendance.", Toast.LENGTH_LONG).show()
             startActivity(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
             return
         }
 
-        bluetoothHelper.scanForTeacherBluetooth { isInRange ->
-            if (isInRange) {
-                geolocationHelper.verifyAttendance("3") { isWithinRange ->
-                    if (isWithinRange) {
-                        startActivity(Intent(this, TimetableSelectionActivity::class.java))
-                    } else {
-                        Toast.makeText(this, "You are not within 10 meters of the teacher.", Toast.LENGTH_LONG).show()
-                    }
-                }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            Toast.makeText(this, "Bluetooth scan permission not granted", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        scanInProgress.value = true
+        isTeacherNearby.value = false
+
+        registerReceiver(bluetoothReceiver, IntentFilter(BluetoothDevice.ACTION_FOUND))
+        bluetoothAdapter?.startDiscovery()
+    }
+
+    private fun verifyLocationBeforeProceed() {
+        geolocationHelper.verifyAttendance("3") { isNear ->
+            if (isNear) {
+                startActivity(Intent(this, TimetableSelectionActivity::class.java))
             } else {
-                Toast.makeText(this, "Teacher not in Bluetooth range. Cannot mark attendance.", Toast.LENGTH_LONG).show()
+                Toast.makeText(this, "Not within 10 meters of the teacher.", Toast.LENGTH_LONG).show()
             }
         }
     }
@@ -90,10 +137,8 @@ class StudentActivity : ComponentActivity() {
     private fun requestPermissions() {
         val permissionsToRequest = mutableListOf<String>()
 
-        if (ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.ACCESS_FINE_LOCATION
-            ) != PackageManager.PERMISSION_GRANTED
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+            != PackageManager.PERMISSION_GRANTED
         ) {
             permissionsToRequest.add(Manifest.permission.ACCESS_FINE_LOCATION)
         }
@@ -112,38 +157,36 @@ class StudentActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         geolocationHelper.stopLocationUpdates()
+        try {
+            unregisterReceiver(bluetoothReceiver)
+        } catch (_: Exception) {}
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun StudentScreen(
-    databaseHelper: DatabaseHelper,
-    geolocationHelper: GeolocationHelper,
-    bluetoothHelper: BluetoothHelper,
+    isBluetoothEnabled: Boolean,
+    scanInProgress: Boolean,
+    isTeacherNearby: Boolean,
+    onStartScan: () -> Unit,
     onRequestPermissions: () -> Unit,
-    onNavigateToTimetable: () -> Unit
+    onVerifyLocation: () -> Unit
 ) {
+
     var statusMessage by remember { mutableStateOf("") }
-    var bluetoothEnabled by remember { mutableStateOf(bluetoothHelper.isBluetoothEnabled()) }
 
     LaunchedEffect(Unit) {
-        if (!geolocationHelper.hasLocationPermission() || !bluetoothHelper.hasBluetoothPermissions()) {
+        if (!isBluetoothEnabled) {
+            statusMessage = "Bluetooth is off. Please enable it."
             onRequestPermissions()
-        }
-
-        if (!bluetoothHelper.isBluetoothEnabled()) {
-            statusMessage = "Bluetooth is not enabled. Please enable it to continue."
         }
     }
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Student Dashboard") },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.primaryContainer
-                )
+                title = { Text("Student Dashboard") }
             )
         }
     ) { paddingValues ->
@@ -155,26 +198,24 @@ fun StudentScreen(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            Text(
-                text = "Student Dashboard",
-                fontSize = 24.sp,
-                fontWeight = FontWeight.Bold
-            )
+            Text("Mark Attendance", fontSize = 24.sp, fontWeight = FontWeight.Bold)
 
-            Button(
-                onClick = onNavigateToTimetable,
-                modifier = Modifier.fillMaxWidth(),
-                enabled = bluetoothEnabled
-            ) {
-                Text("Mark Attendance")
+            Button(onClick = onStartScan, enabled = !scanInProgress) {
+                Text("Scan for Teacher")
+            }
+
+            if (scanInProgress) {
+                Text("Scanning for teacher's Bluetooth...", color = Color.Blue)
+            }
+
+            if (isTeacherNearby) {
+                Button(onClick = onVerifyLocation) {
+                    Text("Verify Location & Proceed")
+                }
             }
 
             if (statusMessage.isNotEmpty()) {
-                Text(
-                    text = statusMessage,
-                    color = Color.Red,
-                    modifier = Modifier.padding(top = 8.dp)
-                )
+                Text(text = statusMessage, color = Color.Red)
             }
         }
     }

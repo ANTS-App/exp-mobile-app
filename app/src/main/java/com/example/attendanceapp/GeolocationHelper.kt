@@ -1,4 +1,5 @@
-package com.example.attendanceapp
+@file:JvmName("GeolocationHelper")
+package com.example.attendanceapp.utilities
 
 import android.Manifest
 import android.annotation.SuppressLint
@@ -7,13 +8,15 @@ import android.content.pm.PackageManager
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import androidx.core.app.ActivityCompat
-import com.google.firebase.database.*
+import com.google.firebase.database.FirebaseDatabase
 
-class GeolocationHelper(private val context: Context) {
+class GeolocationHelper @JvmOverloads constructor(private val context: Context) {
+
     private val TAG = "GeolocationHelper"
     private val locationManager = context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
     private val database = FirebaseDatabase.getInstance().reference.child("users").child("teachers")
@@ -22,80 +25,65 @@ class GeolocationHelper(private val context: Context) {
     private var timeoutRunnable: Runnable = Runnable { }
 
     fun hasLocationPermission(): Boolean {
-        val hasPermission = ActivityCompat.checkSelfPermission(
-            context,
-            Manifest.permission.ACCESS_FINE_LOCATION
-        ) == PackageManager.PERMISSION_GRANTED
+        val hasPermission = ActivityCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
         Log.d(TAG, "Location permission check: $hasPermission")
         return hasPermission
     }
 
     private fun isGpsEnabled(): Boolean {
-        val isEnabled = try {
+        return try {
             locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)
         } catch (e: Exception) {
-            Log.e(TAG, "Error checking GPS: ${e.message}", e)
+            Log.e(TAG, "GPS check failed", e)
             false
         }
-        Log.d(TAG, "GPS enabled: $isEnabled")
-        return isEnabled
     }
 
     @SuppressLint("MissingPermission")
     fun verifyAttendance(teacherId: String, callback: (Boolean) -> Unit) {
-        Log.d(TAG, "Verifying attendance for teacher ID: $teacherId")
-
         if (!hasLocationPermission()) {
-            Log.e(TAG, "Location permission not granted")
             callback(false)
             return
         }
 
         if (!isGpsEnabled()) {
-            Log.w(TAG, "GPS is disabled, accuracy may be reduced")
+            Log.w(TAG, "GPS is disabled")
         }
 
-        Log.d(TAG, "Fetching teacher location from Firebase")
-        database.child("tid2").get().addOnSuccessListener { snapshot ->
-            Log.d(TAG, "Firebase snapshot exists: ${snapshot.exists()}")
+        Log.d(TAG, "Fetching teacher location from Firebase for ID: $teacherId")
+        database.child(teacherId).get().addOnSuccessListener { snapshot ->
+            val teacherLat = snapshot.child("latitude").getValue(Double::class.java)
+            val teacherLng = snapshot.child("longitude").getValue(Double::class.java)
 
-            val teacherLatitude = snapshot.child("latitude").getValue(Double::class.java)
-            val teacherLongitude = snapshot.child("longitude").getValue(Double::class.java)
-
-            if (teacherLatitude == null || teacherLongitude == null) {
-                Log.e(TAG, "Teacher location missing in Firebase")
+            if (teacherLat == null || teacherLng == null) {
+                Log.e(TAG, "Missing teacher location in Firebase")
                 callback(false)
                 return@addOnSuccessListener
             }
 
-            Log.d(TAG, "Teacher location: Lat=$teacherLatitude, Long=$teacherLongitude")
-
-            val lastKnownLocation = getLastKnownLocation()
-            if (lastKnownLocation != null && isLocationFresh(lastKnownLocation)) {
-                processLocation(lastKnownLocation, teacherLatitude, teacherLongitude, callback)
+            val lastLocation = getLastKnownLocation()
+            if (lastLocation != null && isLocationFresh(lastLocation)) {
+                processLocation(lastLocation, teacherLat, teacherLng, callback)
                 return@addOnSuccessListener
             }
 
-            requestLiveLocation(teacherLatitude, teacherLongitude, callback)
+            requestLiveLocation(teacherLat, teacherLng, callback)
 
-        }.addOnFailureListener { error ->
-            Log.e(TAG, "Firebase error: ${error.message}", error)
+        }.addOnFailureListener {
+            Log.e(TAG, "Failed to get teacher location from Firebase", it)
             callback(false)
         }
     }
 
     private fun isLocationFresh(location: Location): Boolean {
-        val timeThreshold = 2 * 60 * 1000
         val locationAge = System.currentTimeMillis() - location.time
-        return locationAge < timeThreshold
+        return locationAge < 2 * 60 * 1000 // 2 minutes
     }
 
-    private fun processLocation(studentLocation: Location, teacherLat: Double, teacherLong: Double, callback: (Boolean) -> Unit) {
-        val studentLatitude = studentLocation.latitude
-        val studentLongitude = studentLocation.longitude
+    private fun processLocation(studentLocation: Location, teacherLat: Double, teacherLng: Double, callback: (Boolean) -> Unit) {
         val teacherLocation = Location("teacher").apply {
             latitude = teacherLat
-            longitude = teacherLong
+            longitude = teacherLng
         }
         val distance = studentLocation.distanceTo(teacherLocation)
         Log.d(TAG, "Distance to teacher: $distance meters")
@@ -103,24 +91,24 @@ class GeolocationHelper(private val context: Context) {
     }
 
     @SuppressLint("MissingPermission")
-    private fun requestLiveLocation(teacherLat: Double, teacherLong: Double, callback: (Boolean) -> Unit) {
+    private fun requestLiveLocation(teacherLat: Double, teacherLng: Double, callback: (Boolean) -> Unit) {
         stopLocationUpdates()
         locationListener = object : LocationListener {
             override fun onLocationChanged(location: Location) {
-                processLocation(location, teacherLat, teacherLong, callback)
+                processLocation(location, teacherLat, teacherLng, callback)
                 stopLocationUpdates()
             }
-            override fun onProviderDisabled(provider: String) {}
+
+            override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
             override fun onProviderEnabled(provider: String) {}
-            override fun onStatusChanged(provider: String?, status: Int, extras: android.os.Bundle?) {}
+            override fun onProviderDisabled(provider: String) {}
         }
+
         try {
-            locationManager.requestLocationUpdates(
-                LocationManager.GPS_PROVIDER, 0L, 0f, locationListener!!, Looper.getMainLooper()
-            )
+            locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 0L, 0f, locationListener!!, Looper.getMainLooper())
             setLocationTimeout(callback)
         } catch (e: Exception) {
-            Log.e(TAG, "Error requesting location updates: ${e.message}", e)
+            Log.e(TAG, "Failed to request location updates", e)
             callback(false)
         }
     }
@@ -132,7 +120,7 @@ class GeolocationHelper(private val context: Context) {
             val lastLocation = getLastKnownLocation()
             if (lastLocation != null) {
                 Log.d(TAG, "Using last known location after timeout")
-                processLocation(lastLocation, 0.0, 0.0, callback)
+                processLocation(lastLocation, 0.0, 0.0, callback) // May be adjusted if needed
             } else {
                 stopLocationUpdates()
                 callback(false)
@@ -144,23 +132,22 @@ class GeolocationHelper(private val context: Context) {
     fun stopLocationUpdates() {
         locationListener?.let {
             locationManager.removeUpdates(it)
-            locationListener = null
         }
+        locationListener = null
         timeoutHandler?.removeCallbacks(timeoutRunnable)
     }
 
     @SuppressLint("MissingPermission")
-    fun getLastKnownLocation(): Location? {
-        if (!hasLocationPermission()) return null
-        return try {
-            locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
-                ?: locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
-                ?: locationManager.getLastKnownLocation(LocationManager.PASSIVE_PROVIDER)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error getting last known location: ${e.message}", e)
-            null
-        }
+    private fun getLastKnownLocation(): Location? {
+        return if (hasLocationPermission()) {
+            try {
+                locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
+                    ?: locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
+                    ?: locationManager.getLastKnownLocation(LocationManager.PASSIVE_PROVIDER)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error getting last known location", e)
+                null
+            }
+        } else null
     }
-
-
 }
